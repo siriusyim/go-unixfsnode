@@ -269,4 +269,5 @@ var roughLinkSize = 34 + 8 + 5   // sha256 multihash + size + no name + protobuf
 //	var DefaultLinksPerBlock = (roughLinkBlockSize / roughLinkSize)
 //	                         = ( 8192 / 47 )
 //	                         = (approximately) 174
-var DefaultLinksPerBlock = roughLinkBlockSize / roughLinkSize
+//var DefaultLinksPerBlock = roughLinkBlockSize / roughLinkSize
+var DefaultLinksPerBlock = 2
