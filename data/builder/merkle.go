@@ -1,26 +1,22 @@
 package builder
 
 import (
-	"fmt"
-	"io"
-	"io/fs"
-	"math"
-	"os"
-	"path"
-	"sync"
-
-	"github.com/ipfs/go-cid"
-	chunk "github.com/ipfs/go-ipfs-chunker"
-	"github.com/ipfs/go-unixfsnode/data"
 	dagpb "github.com/ipld/go-codec-dagpb"
 	"github.com/ipld/go-ipld-prime"
 	"github.com/ipld/go-ipld-prime/datamodel"
-	"github.com/ipld/go-ipld-prime/linking"
-	cidlink "github.com/ipld/go-ipld-prime/linking/cid"
-	basicnode "github.com/ipld/go-ipld-prime/node/basic"
-	"github.com/multiformats/go-multihash"
 )
 
+var FileLinkProto = fileLinkProto
+var LeafLinkProto = leafLinkProto
+
+func EstimateDirSize(entries []dagpb.PBLink) int {
+	return estimateDirSize(entries)
+}
+func SizedStore(ls *ipld.LinkSystem, lp datamodel.LinkPrototype, n datamodel.Node) (datamodel.Link, uint64, error) {
+	return sizedStore(ls, lp, n)
+}
+
+/*
 type FileSliceKey string
 type FileSlice struct {
 	Path   string
@@ -34,28 +30,30 @@ func (fs *FileSlice) Key() FileSliceKey {
 	return FileSliceKey(fmt.Sprintf("%s-%d", fs.Path, fs.Offset))
 }
 
+func (fs *FileSlice) AbsPath() string {
+	return fs.Path
+}
+
 type MerkleCar struct {
 	size int
 	max  int
 	fi   []*FileSlice
 	done bool
-	ls   *linking.LinkSystem
 }
 
-func NewCar(max int, ls *linking.LinkSystem) *MerkleCar {
+func NewCar(max int) *MerkleCar {
 	return &MerkleCar{
 		size: 0,
 		max:  max,
 		fi:   make([]*FileSlice, 0),
-		ls:   ls,
 	}
 }
 
 func (m *MerkleCar) isOverflow(size int) bool {
 	if size+m.size > m.max {
-		return false
+		return true
 	}
-	return true
+	return false
 }
 
 func (m *MerkleCar) addFileSlice(fs *FileSlice) {
@@ -76,6 +74,13 @@ type NextBytes struct {
 	size int
 }
 
+type FileStatus struct {
+	offset   int
+	done     bool
+	spl      chunk.Splitter
+	doneFunc func()
+}
+
 type UnixFsMerkle struct {
 	fi map[FileSliceKey]struct{}
 	lk sync.Mutex
@@ -88,27 +93,28 @@ type UnixFsMerkle struct {
 
 	curCar *MerkleCar
 
-	curData     *NextBytes
-	nextOffsets map[string]int
+	curData *NextBytes
+
+	fileInfos map[string]*FileStatus
 
 	maxSize   int
 	blockSize int
 }
 
-func NewUnixFsMerkle(max int, ls *linking.LinkSystem) *UnixFsMerkle {
+func NewUnixFsMerkle(max int) *UnixFsMerkle {
 	return &UnixFsMerkle{
 		fi:           make(map[FileSliceKey]struct{}),
 		cars:         make([]*MerkleCar, 0),
 		maxSize:      max,
 		curFileSlice: nil,
 		blockSize:    1024 * 1024 * 2,
-		nextOffsets:  make(map[string]int, 0),
-		curCar:       NewCar(max, ls),
+		fileInfos:    make(map[string]*FileStatus, 0),
+		curCar:       NewCar(max),
 	}
 }
 
-func (u *UnixFsMerkle) ChangeCar(ls *linking.LinkSystem) {
-	u.curCar = NewCar(u.maxSize, ls)
+func (u *UnixFsMerkle) ChangeCar() {
+	u.curCar = NewCar(u.maxSize)
 }
 
 func (u *UnixFsMerkle) AddFileSlice(fs *FileSlice) error {
@@ -119,17 +125,14 @@ func (u *UnixFsMerkle) AddFileSlice(fs *FileSlice) error {
 	return nil
 }
 
-func (u *UnixFsMerkle) LastFileSlice(path string, lastSlice string) (*FileSlice, error) {
-	return nil, nil
-}
-func (u *UnixFsMerkle) NextFileSlice(path string, lastSlice string) (*FileSlice, error) {
-	return nil, nil
-}
-
 func (u *UnixFsMerkle) BuildUnixFSRecursive(root string, ls *ipld.LinkSystem) (ipld.Link, uint64, error) {
 	info, err := os.Lstat(root)
 	if err != nil {
 		return nil, 0, err
+	}
+
+	if u.curCar.isComplete() {
+		return nil, 0, nil
 	}
 
 	m := info.Mode()
@@ -143,11 +146,19 @@ func (u *UnixFsMerkle) BuildUnixFSRecursive(root string, ls *ipld.LinkSystem) (i
 		lnks := make([]dagpb.PBLink, 0, len(entries))
 
 		for _, e := range entries {
-			lnk, sz, err := u.BuildUnixFSRecursive(path.Join(root, e.Name()), ls)
+			absPath := path.Join(root, e.Name())
+			if v, ok := u.fileInfos[absPath]; ok {
+				if v.done {
+					continue
+				}
+			}
+			lnk, sz, err := u.BuildUnixFSRecursive(absPath, ls)
 			if err != nil {
 				return nil, 0, err
 			}
-
+			if lnk == nil {
+				continue
+			}
 			tsize += sz
 			entry, err := BuildUnixFSDirectoryEntry(e.Name(), int64(sz), lnk)
 			if err != nil {
@@ -173,7 +184,23 @@ func (u *UnixFsMerkle) BuildUnixFSRecursive(root string, ls *ipld.LinkSystem) (i
 		if err != nil {
 			return nil, 0, err
 		}
-		defer fp.Close()
+		//defer fp.Close()
+
+		if _, ok := u.fileInfos[root]; !ok {
+			spl, err := chunk.FromString(fp, fmt.Sprintf("size-%d", u.blockSize))
+			if err != nil {
+				return nil, 0, err
+			}
+
+			u.fileInfos[root] = &FileStatus{
+				offset: 0,
+				spl:    spl,
+				doneFunc: func() {
+					fp.Close()
+				},
+			}
+
+		}
 		outLnk, sz, err := u.BuildUnixFSFile(root, fp, fmt.Sprintf("size-%d", u.blockSize), ls)
 		if err != nil {
 			return nil, 0, err
@@ -185,10 +212,12 @@ func (u *UnixFsMerkle) BuildUnixFSRecursive(root string, ls *ipld.LinkSystem) (i
 }
 
 func (u *UnixFsMerkle) BuildUnixFSFile(path string, r io.Reader, chunker string, ls *ipld.LinkSystem) (ipld.Link, uint64, error) {
-	s, err := chunk.FromString(r, chunker)
-	if err != nil {
-		return nil, 0, err
-	}
+	v := u.fileInfos[path]
+	s := v.spl
+	//s, err := chunk.FromString(r, chunker)
+	//if err != nil {
+	//	return nil, 0, err
+	//}
 
 	var prev []ipld.Link
 	var prevLen []uint64
@@ -214,6 +243,13 @@ func (u *UnixFsMerkle) BuildUnixFSFile(path string, r io.Reader, chunker string,
 	}
 }
 
+func (u *UnixFsMerkle) IsAbort() bool {
+	if u.curData != nil {
+		return true
+	}
+	return false
+}
+
 func (u *UnixFsMerkle) fileTreeRecursive(path string, depth int, children []ipld.Link, childLen []uint64, src chunk.Splitter, ls *ipld.LinkSystem) (link ipld.Link, totalSize uint64, err error) {
 	if depth == 1 && len(children) > 0 {
 		return nil, 0, fmt.Errorf("leaf nodes cannot have children")
@@ -233,20 +269,20 @@ func (u *UnixFsMerkle) fileTreeRecursive(path string, depth int, children []ipld
 		} else {
 			leaf, err = src.NextBytes()
 			if err == io.EOF {
+				u.fileInfos[path].done = true
+				u.fileInfos[path].doneFunc()
 				return nil, 0, nil
 			} else if err != nil {
 				return nil, 0, err
 			}
 
 			leafSize := len(leaf)
-			if v, ok := u.nextOffsets[path]; ok {
-				offset = v
-				v = v + leafSize
-			} else {
-				offset = 0
-				u.nextOffsets[path] = 0
+			if v, ok := u.fileInfos[path]; ok {
+				offset = v.offset
+				v.offset = v.offset + leafSize
+				fmt.Printf("path %s fileinfos offset %d offset :%d \n", path, u.fileInfos[path].offset, offset)
 			}
-
+			//fmt.Printf("####### fileTreeRecursive path :%s curData is nil ,offset:%d\n", path, offset)
 		}
 
 		leafSize := len(leaf)
@@ -255,6 +291,7 @@ func (u *UnixFsMerkle) fileTreeRecursive(path string, depth int, children []ipld
 			size: leafSize,
 		}
 
+		//fmt.Printf("fileTreeRecursive curData path: %s curCar size:%d curCar max: %d curData size:%d\n", path, u.curCar.size, u.curCar.max, u.curData.size)
 		u.curFileSlice = &FileSlice{
 			Path:   path,
 			Offset: offset,
@@ -263,14 +300,22 @@ func (u *UnixFsMerkle) fileTreeRecursive(path string, depth int, children []ipld
 
 		if u.curCar.isOverflow(u.curData.size) {
 			u.curCar.complete()
+			//fmt.Printf("===== fileTreeRecursive complete curData path: %s curCar size:%d curCar max: %d curData size:%d\n", path, u.curCar.size, u.curCar.max, u.curData.size)
 			return nil, 0, nil
 		}
+
+		//key := u.curFileSlice.Key()
+		//fmt.Printf("\\\\\\\\\\FileSliceKey:%s\n", key)
+		//if _, ok := u.fi[key]; ok {
+		//	fmt.Printf("/////FileSliceKey:%s\n", key)
+		//	return nil, 0, nil
+		//}
 
 		node := basicnode.NewBytes(leaf)
 
 		u.curData = nil
 
-		return u.sizedStore(ls, leafLinkProto, node)
+		return u.sizedStoreFile(ls, leafLinkProto, node)
 	}
 	// depth > 1.
 	totalSize = uint64(0)
@@ -371,10 +416,13 @@ func (u *UnixFsMerkle) BuildUnixFSDirectoryMerkle(entries []dagpb.PBLink, ls *ip
 			lentries = entries[:splnum/2]
 			rentries = entries[splnum/2:]
 		}
+		name = path.Base(name)
 		llnk, lsize, err := u.BuildUnixFSDirectoryMerkle(lentries, ls, depth+1, name)
 		if err != nil {
 			return nil, 0, err
 		}
+		//lid := uuid.New()
+		//lentry, err := BuildUnixFSDirectoryEntry(fmt.Sprintf("%s-vlayer-%d-%s", name, depth+1, lid.String()), int64(lsize), llnk)
 
 		lentry, err := BuildUnixFSDirectoryEntry(fmt.Sprintf("%s-vlayer-%d", name, depth+1), int64(lsize), llnk)
 		if err != nil {
@@ -386,6 +434,8 @@ func (u *UnixFsMerkle) BuildUnixFSDirectoryMerkle(entries []dagpb.PBLink, ls *ip
 			return nil, 0, err
 		}
 
+		//rid := uuid.New()
+		//rentry, err := BuildUnixFSDirectoryEntry(fmt.Sprintf("%s-vlayer-%d-%s", name, depth+1, rid.String()), int64(rsize), rlnk)
 		rentry, err := BuildUnixFSDirectoryEntry(fmt.Sprintf("%s-vlayer-%d", name, depth+1), int64(rsize), rlnk)
 		if err != nil {
 			return nil, 0, err
@@ -453,6 +503,14 @@ func (u *UnixFsMerkle) sizedStore(ls *ipld.LinkSystem, lp datamodel.LinkPrototyp
 	lnk, err := wrappedLinkSystem(ls, func(bc int) {
 		byteCount = bc
 	}).Store(ipld.LinkContext{}, lp, n)
+	return lnk, uint64(byteCount), err
+}
+
+func (u *UnixFsMerkle) sizedStoreFile(ls *ipld.LinkSystem, lp datamodel.LinkPrototype, n datamodel.Node) (datamodel.Link, uint64, error) {
+	var byteCount int
+	lnk, err := wrappedLinkSystem(ls, func(bc int) {
+		byteCount = bc
+	}).Store(ipld.LinkContext{}, lp, n)
 	if err == nil {
 		rcl, ok := lnk.(cidlink.Link)
 		if !ok {
@@ -464,3 +522,4 @@ func (u *UnixFsMerkle) sizedStore(ls *ipld.LinkSystem, lp datamodel.LinkPrototyp
 
 	return lnk, uint64(byteCount), err
 }
+*/
