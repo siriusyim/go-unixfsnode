@@ -16,6 +16,10 @@ func SizedStore(ls *ipld.LinkSystem, lp datamodel.LinkPrototype, n datamodel.Nod
 	return sizedStore(ls, lp, n)
 }
 
+func WrappedLinkSystem(ls *ipld.LinkSystem, byteCountCb func(byteCount int)) *ipld.LinkSystem {
+	return wrappedLinkSystem(ls, byteCountCb)
+}
+
 /*
 type FileSliceKey string
 type FileSlice struct {
